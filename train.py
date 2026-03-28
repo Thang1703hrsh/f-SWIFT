@@ -123,7 +123,7 @@ def main(config: DictConfig):
     policy_tokenizer = transformers.AutoTokenizer.from_pretrained(config.model.name_or_path)
     disable_dropout(policy)
 
-    if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+    if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'fswift'}:
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         # reference_model_dtype = torch.float16

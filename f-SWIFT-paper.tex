@@ -1,0 +1,571 @@
+\documentclass[11pt,a4paper]{article}
+
+% ===== Packages =====
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+% \usepackage{bbm}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{thmtools}
+\usepackage{xcolor}
+
+% ===== Theorem Environments =====
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\newtheorem{remark}[theorem]{Remark}
+
+% ===== Custom Commands =====
+\newcommand{\Pd}{\mathbb{P}_d}
+\newcommand{\Ps}{\mathbb{P}_{\theta^S}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Df}{D_f}
+\newcommand{\DKL}{D_{\mathrm{KL}}}
+\newcommand{\DSeqKL}{D_{\mathrm{SeqKL}}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+% ===== Title =====
+\title{\textbf{Token-Level $f$-Discriminative Self-Play with Importance-Aware Guidance for Large Language Models}}
+
+\author{
+  Author Names \\
+  \textit{Affiliations} \\
+  \texttt{emails}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Leveraging the power of Large Language Models (LLMs) through preference optimization is crucial for aligning model outputs with human values. Self-Play Fine-Tuning (SPIN) enables iterative self-improvement without external preference data, while its extension SWIFT (Self-Play Weighted Fine-Tuning) introduces token-level importance weighting guided by a teacher model. However, both SPIN and SWIFT rely on Integral Probability Metrics (IPM) for distribution matching, which treats chosen and rejected responses symmetrically and provides limited discriminative capacity as the model improves. In this paper, we propose \textbf{f-SWIFT} (\textbf{$f$-Divergence Self-Play Weighted Fine-Tuning}), which generalizes the distribution matching objective from IPM to $f$-divergence via its Fenchel conjugate variational representation. By applying the conjugate function $f^*$ to the rejected term, f-SWIFT introduces a principled asymmetry that amplifies the penalty on high-reward rejected tokens—precisely where the model needs stronger gradient signals in later iterations. We establish tight variational bounds (both upper and lower) on the token-level $f$-divergence between the data and model distributions, and derive an end-to-end training objective that naturally incorporates token-level importance weights. Theoretically, we show that both SPIN and SWIFT are recovered as special cases of our framework. We further inherit the teacher-guided token importance estimation and cross-tokenizer alignment mechanisms from SWIFT, ensuring practical applicability.
+\end{abstract}
+
+% ============================================================
+% SECTION 2: PRELIMINARIES
+% ============================================================
+\section{Preliminaries}
+\label{sec:preliminaries}
+
+\subsection{Notations and Problem Setting}
+\label{subsec:notations}
+
+We consider a Large Language Model (LLM) parameterized by $\theta$ whose output distribution is denoted $\pi_\theta$. Given an input prompt $x = [x_1, \ldots, x_n]$, the model generates a response $y = [y_1, \ldots, y_T]$ autoregressively:
+\begin{equation}
+    \pi_\theta(y \mid x) = \prod_{t=1}^{T} \pi_\theta(y_t \mid x, y_{<t}),
+\end{equation}
+where $y_{<1} = \emptyset$ and $y_{<t} = [y_1, \ldots, y_{t-1}]$ for $t \geq 2$.
+
+We are given a supervised fine-tuning (SFT) dataset $\mathcal{D} = \{(x^i, y^i)\}_{i=1}^N$, where each $y^i$ is a high-quality human-annotated response to prompt $x^i$. Let $\theta^T$ denote the parameters of a \emph{teacher model} and $\theta^S$ the parameters of a \emph{student model} to be trained. We write $\theta^S_k$ for the student model at self-play iteration~$k$.
+
+Throughout, we denote by $\Pd$ the distribution of ground-truth pairs $(x, y)$ sampled from $\mathcal{D}$, and by $\Ps$ the distribution of synthetic pairs $(x, y')$ where $y' \sim \pi_{\theta^S}(\cdot \mid x)$. The associated density functions are written $p_d(x, y)$ and $p_{\theta^S}(x, y)$, respectively.
+
+\subsection{Supervised Fine-Tuning (SFT)}
+\label{subsec:sft}
+
+Supervised fine-tuning trains the LLM to minimize the negative log-likelihood on the SFT dataset:
+\begin{equation}
+    \mathcal{L}_{\mathrm{SFT}}(\theta) = -\E_{x \sim q(\cdot),\, y \sim p_{\mathrm{data}}(\cdot \mid x)} \left[ \log \pi_\theta(y \mid x) \right].
+    \label{eq:sft}
+\end{equation}
+The minimum of $\mathcal{L}_{\mathrm{SFT}}$ is achieved when $\pi_\theta(y \mid x) = p_{\mathrm{data}}(y \mid x)$. However, further applying SFT on the same dataset after convergence typically yields no improvement or even degrades performance.
+
+\subsection{Self-Play Fine-Tuning (SPIN)}
+\label{subsec:spin}
+
+SPIN~\cite{chen2024spin} introduces an iterative self-play mechanism where the model generates its own training data. At each iteration $t$, the current model $\pi_{\theta_t}$ generates synthetic responses $y' \sim \pi_{\theta_t}(\cdot \mid x)$ for prompts in $\mathcal{D}$. The model is then updated by training a new model $\pi_{\theta_{t+1}}$ to distinguish ground-truth responses from self-generated ones:
+\begin{equation}
+    \mathcal{L}_{\mathrm{SPIN}}(\theta, \theta_t) = \E \left[ \ell \left( \lambda \log \frac{\pi_\theta(y \mid x)}{\pi_{\theta_t}(y \mid x)} - \lambda \log \frac{\pi_\theta(y' \mid x)}{\pi_{\theta_t}(y' \mid x)} \right) \right],
+    \label{eq:spin}
+\end{equation}
+where $\ell(\cdot)$ is a convex, monotonically decreasing loss function (e.g., the logistic loss $\ell(t) = \log(1 + e^{-t})$), and $\lambda > 0$ is a scaling parameter. The expectation is taken over $x \sim q(\cdot)$, $y \sim p_{\mathrm{data}}(\cdot \mid x)$, and $y' \sim \pi_{\theta_t}(\cdot \mid x)$.
+
+A key theoretical result of SPIN is that the global optimum of \eqref{eq:spin} is achieved if and only if $\pi_{\theta_t}(\cdot \mid x) = p_{\mathrm{data}}(\cdot \mid x)$, ensuring that the iterative process converges to the target distribution.
+
+\textbf{Limitation.} SPIN operates at the \emph{sequence level}, treating all tokens uniformly. This overlooks the fine-grained quality variations within responses: even in a rejected response, many individual tokens may be of high quality.
+
+\subsection{Self-Play Weighted Fine-Tuning (SWIFT)}
+\label{subsec:swift}
+
+SWIFT~\cite{le2025swift} addresses SPIN's limitation by introducing token-level importance weighting. It reformulates the distribution matching objective at the token level using the Integral Probability Metric (IPM).
+
+\subsubsection{Token-Level Distribution Matching via IPM}
+
+The following lemma establishes the foundation for token-level matching.
+
+\begin{lemma}[Token-level necessary and sufficient conditions~\cite{le2025swift}]
+\label{lem:token_matching}
+The distributions $\Pd$ and $\Ps$ are equal, i.e., $\Pd = \Ps$, if and only if
+\begin{equation}
+    p_d(y_t \mid x, y_{<t}) = p_{\theta^S}(y_t \mid x, y_{<t}), \quad \forall\, t \leq T.
+    \label{eq:token_matching}
+\end{equation}
+\end{lemma}
+
+Based on \Cref{lem:token_matching}, SWIFT measures the divergence between $p_d(y_t \mid x, y_{<t})$ and $p_{\theta^S}(y_t \mid x, y_{<t})$ at each position $t$ using the IPM:
+\begin{equation}
+    \forall\, t: \quad \max_{r_t \in \mathcal{R}_t^k} \left\{ \E_{\Pd^{x,y_{<t}}} \left[ r_t([x, y_{<t}], y_t) \right] - \E_{\Ps^{x,y_{<t}}} \left[ r_t([x, y_{<t}], y'_t) \right] \right\},
+    \label{eq:ipm_token}
+\end{equation}
+where $r_t([x, y_{<t}], z)$ is a token-based reward function belonging to a function family $\mathcal{R}_t^k$, and $y'_t \sim \pi_{\theta^S_k}(\cdot \mid x, y_{<t})$.
+
+\subsubsection{Consistency and Sequence-Level Aggregation}
+
+\begin{definition}[Consistency~\cite{le2025swift}]
+\label{def:consistency}
+The sequence-level function family $\mathcal{R}^k$ is \emph{consistent} with the token-level families $[\mathcal{R}_t^k]_t$ if, for any sequence of functions $[r_t \in \mathcal{R}_t^k]_t$, there exists $r \in \mathcal{R}^k$ such that $r(x, y_{\leq t}) = r_t([x, y_{<t}], y_t)$ for all $[x, y_{<t}] \sim \mathcal{D}$, and conversely.
+\end{definition}
+
+Under the consistency property, the token-level objectives in \eqref{eq:ipm_token} can be aggregated into a single sequence-level optimization:
+\begin{equation}
+    \max_{r \in \mathcal{R}^k} \E_{(x,y) \sim \mathcal{D},\, y' \sim \pi_{\theta^S_k}(\cdot \mid x)} \left[ \sum_t \gamma^{t-1} r([x, y_{<t}], y_t) - \sum_t \gamma^{t-1} r([x, y'_{<t}], y'_t) \right],
+    \label{eq:swift_seq}
+\end{equation}
+where $\gamma \in [0,1]$ is a discount factor (typically $\gamma = 1$).
+
+\subsubsection{Advantage Function and Token Weighting}
+
+SWIFT incorporates token-level importance via the advantage function:
+\begin{equation}
+    \max_{\pi_{\theta^S}} \E_{x, y_{<t} \sim \mathcal{D},\, y'_t \sim \pi_{\theta^S}(\cdot \mid x, y_{<t})} \left[ \omega_t A^{\pi_{\theta^S_k}}([x, y_{<t}], y'_t) \right] - \beta \DKL\!\left(\pi_{\theta^S}(\cdot \mid [x, y_{<t}]) \,\|\, \pi_{\theta^S_k}(\cdot \mid [x, y_{<t}])\right),
+    \label{eq:advantage}
+\end{equation}
+where $A^\pi([x, y_{<t}], y'_t) := Q^\pi([x, y_{<t}], y'_t) - V^\pi([x, y_{<t}])$ is the advantage function, $\omega_t$ are token importance weights, and $\beta > 0$ controls the KL regularization.
+
+\begin{lemma}[Closed-form solution~\cite{le2025swift}]
+\label{lem:closed_form}
+The optimization problem \eqref{eq:advantage} admits the closed-form solution:
+\begin{equation}
+    \pi^*_{\theta^S}(z \mid x, y_{<t}) = \frac{\pi_{\theta^S_k}(z \mid x, y_{<t}) \exp\!\left(\frac{\omega_t}{\beta} Q^{\pi_{\theta^S_k}}([x, y_{<t}], z)\right)}{Z([x, y_{<t}]; \omega_t, \beta)},
+    \label{eq:closed_form}
+\end{equation}
+where $Z([x, y_{<t}]; \omega_t, \beta)$ is the partition function. Consequently:
+\begin{equation}
+    Q^{\pi_{\theta^S_k}}([x, y_{<t}], z) = \omega_t \beta \log \frac{\pi^*_{\theta^S}(z \mid x, y_{<t})}{\pi_{\theta^S_k}(z \mid x, y_{<t})} + \omega_t \beta \log Z([x, y_{<t}]; \omega_t, \beta).
+    \label{eq:q_function}
+\end{equation}
+\end{lemma}
+
+This closed-form solution induces the function family:
+\begin{equation}
+    \mathcal{R}^k = \left\{ r : \exists\, \theta^S \in \Theta \;\text{s.t.}\; Q^{\pi_{\theta^S_k}}([x, y_{<t}], z) = \omega_t \beta \log \frac{\pi_{\theta^S}(z \mid x, y_{<t})}{\pi_{\theta^S_k}(z \mid x, y_{<t})} + \omega_t \beta \log Z \right\}.
+    \label{eq:function_family}
+\end{equation}
+
+\subsubsection{SWIFT Training Objective}
+
+Combining the above, the SWIFT training objective is:
+\begin{equation}
+    \min_{\pi_{\theta^S}} \E_{(x,y) \sim \mathcal{D},\, y' \sim \pi_{\theta^S_k}(\cdot \mid x)} \left[ l\!\left(u_{\mathrm{SWIFT}} - v\right) \right],
+    \label{eq:swift_objective}
+\end{equation}
+where $l(t) = \log(1 + e^{-t})$ and:
+\begin{align}
+    u_{\mathrm{SWIFT}} &= \sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y_t \mid x, y_{<t})}{\pi_{\theta^S_k}(y_t \mid x, y_{<t})} - \sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y'_t \mid x, y'_{<t})}{\pi_{\theta^S_k}(y'_t \mid x, y'_{<t})}, \label{eq:u_swift} \\
+    v &= \beta \DSeqKL(x, y, \omega; \pi_{\theta^S} \| \pi_{\theta^S_k}) - \beta \DSeqKL(x, y', \omega; \pi_{\theta^S} \| \pi_{\theta^S_k}), \label{eq:v}
+\end{align}
+with the weighted sequence KL divergence:
+\begin{equation}
+    \DSeqKL(x, y, \omega; \pi_1 \| \pi_2) := \sum_t \omega_t^{-1} \DKL\!\left(\pi_1(\cdot \mid x, y_{<t}) \,\|\, \pi_2(\cdot \mid x, y_{<t})\right).
+    \label{eq:seq_kl}
+\end{equation}
+
+\textbf{Limitation of SWIFT.} The IPM-based objective in \eqref{eq:ipm_token} treats chosen and rejected tokens \emph{symmetrically}---both are evaluated by the same function $r_t$ without any nonlinear transformation. As the model improves across iterations, rejected responses become increasingly similar to ground-truth responses. This causes the difference $r_t(\text{chosen}) - r_t(\text{rejected})$ to vanish, leading to weak gradient signals in later iterations. Moreover, IPM provides only a single distance value without upper or lower bounds on the true divergence, limiting theoretical guarantees on approximation quality.
+
+\subsection{$f$-Divergence and Fenchel Conjugate}
+\label{subsec:f_div}
+
+We now introduce the mathematical tools that underpin our extension.
+
+\begin{definition}[$f$-Divergence]
+\label{def:f_div}
+Let $P$ and $Q$ be two probability distributions with $P \ll Q$ (i.e., $P$ is absolutely continuous with respect to $Q$). For a convex, lower semi-continuous function $f: \R^+ \to \R$ with $f(1) = 0$, the $f$-divergence from $P$ to $Q$ is defined as:
+\begin{equation}
+    \Df(P \| Q) = \E_Q \left[ f\!\left(\frac{dP}{dQ}\right) \right] = \int f\!\left(\frac{p(z)}{q(z)}\right) q(z)\, dz.
+    \label{eq:f_div_def}
+\end{equation}
+\end{definition}
+
+The $f$-divergence family encompasses most commonly used statistical divergences:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Divergence} & $\bm{f(u)}$ & $\bm{f^*(t)}$ & \textbf{Properties} \\
+\midrule
+KL & $u \log u$ & $e^{t-1}$ & Mode-covering \\
+Reverse KL & $-\log u$ & $-1 - \log(-t),\; t < 0$ & Mode-seeking \\
+Jensen-Shannon & $u\log u - (u{+}1)\log\frac{u+1}{2}$ & $-\log(2 - e^t)$ & Symmetric, bounded \\
+Pearson $\chi^2$ & $(u-1)^2$ & $\frac{t^2}{4} + t$ & Tail-sensitive \\
+Squared Hellinger & $(\sqrt{u} - 1)^2$ & $\frac{t}{1-t},\; t < 1$ & Bounded, smooth \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{definition}[Fenchel Conjugate]
+\label{def:fenchel}
+The Fenchel conjugate (or convex conjugate) of $f$ is:
+\begin{equation}
+    f^*(t) = \sup_{u \in \mathrm{dom}(f)} \left\{ ut - f(u) \right\}.
+    \label{eq:fenchel}
+\end{equation}
+\end{definition}
+
+A fundamental result in convex analysis states that for any convex, lower semi-continuous $f$, the biconjugate satisfies $f^{**} = f$, which yields the Fenchel--Moreau theorem:
+\begin{equation}
+    f(u) = \sup_{t \in \mathrm{dom}(f^*)} \left\{ ut - f^*(t) \right\}.
+    \label{eq:biconjugate}
+\end{equation}
+
+This identity leads directly to the \emph{variational representation} of $f$-divergence:
+\begin{equation}
+    \Df(P \| Q) = \sup_{r} \left\{ \E_P[r(z)] - \E_Q[f^*(r(z))] \right\},
+    \label{eq:variational}
+\end{equation}
+where the supremum is over all measurable functions $r$ such that the expectations exist. The key observation is that $f^*$ is applied only to the term under $Q$ (the rejected distribution in our context), introducing a natural \textbf{asymmetry} between how chosen and rejected samples are processed---a property absent in the symmetric IPM formulation of SWIFT.
+
+
+% ============================================================
+% SECTION 3: METHODOLOGY
+% ============================================================
+\section{Methodology: $f$-Divergence Self-Play Weighted Fine-Tuning}
+\label{sec:method}
+
+In this section, we present our proposed framework, \textbf{f-SWIFT}, which generalizes SWIFT by replacing the IPM-based distribution matching with $f$-divergence variational bounds at the token level. We proceed in four stages: (1)~establishing token-level $f$-divergence bounds, (2)~aggregating to sequence-level objectives, (3)~deriving the end-to-end training objective, and (4)~inheriting the teacher-guided token importance estimation.
+
+\subsection{Token-Level $f$-Divergence Variational Bounds}
+\label{subsec:token_f_div}
+
+Our starting point is \Cref{lem:token_matching}: to match $\Pd = \Ps$, it suffices to match the conditional distributions $p_d(y_t \mid x, y_{<t})$ and $p_{\theta^S}(y_t \mid x, y_{<t})$ at each position $t$. Rather than measuring this discrepancy with the symmetric IPM as in SWIFT, we employ the $f$-divergence with its variational representation, yielding both a lower and upper bound.
+
+We denote the conditional distribution of $y_t$ given context $[x, y_{<t}]$ under the data distribution as $\Pd^{x, y_{<t}}$, and under the student model at iteration $k$ as $\mathbb{P}_{\theta^S_k}^{x, y_{<t}}$.
+
+\begin{theorem}[Token-level $f$-divergence bounds]
+\label{thm:f_bounds}
+Let $f: \R^+ \to \R$ be a convex, lower semi-continuous function with Fenchel conjugate $f^*$. For any function family $\mathcal{R}_t^k$, the following inequalities hold:
+
+\textbf{(i) Lower bound:}
+\begin{equation}
+    \Df\!\left(\Pd^{x,y_{<t}},\, \mathbb{P}_{\theta^S_k}^{x,y_{<t}}\right) \geq \max_{r_t \in \mathcal{R}_t^k} \left\{ \E_{\Pd^{x,y_{<t}}}\!\left[r_t([x, y_{<t}], y_t)\right] - \E_{\mathbb{P}_{\theta^S_k}^{x,y_{<t}}}\!\left[f^*\!\left(r_t([x, y_{<t}], y'_t)\right)\right] \right\}.
+    \label{eq:lower_bound}
+\end{equation}
+
+\textbf{(ii) Upper bound:}
+\begin{equation}
+    \Df\!\left(\Pd^{x,y_{<t}},\, \mathbb{P}_{\theta^S_k}^{x,y_{<t}}\right) \leq \max_{r_t \in \mathcal{R}_t^k} \left\{ \E_{\Pd^{x,y_{<t}}}\!\left[r_t\right] - \E_{\mathbb{P}_{\theta^S_k}^{x,y_{<t}}}\!\left[f^*(r_t)\right] \right\} + d(r_t^*, \mathcal{R}_t^k),
+    \label{eq:upper_bound}
+\end{equation}
+where the optimal (unconstrained) reward function is:
+\begin{equation}
+    r_t^*([x, y_{<t}], y_t) = f'\!\left(\frac{p_d(y_t \mid x, y_{<t})}{p_{\theta^S_k}(y_t \mid x, y_{<t})}\right),
+    \label{eq:optimal_reward}
+\end{equation}
+and the approximation error is:
+\begin{equation}
+    d(r_t^*, \mathcal{R}_t^k) := \min_{r_t \in \mathcal{R}_t^k} \left\{ \left\|r_t^* - r_t\right\|^2_{L^2(\Pd)} + \left\|f^* \circ r_t^* - f^* \circ r_t\right\|^2_{L^2(\Pd)} \right\}.
+    \label{eq:approx_error}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+\textbf{Part (i).} By the Fenchel--Moreau theorem (\Cref{eq:biconjugate}), for any $t$ in the domain of $f^*$:
+\begin{equation}
+    f(u) \geq ut - f^*(t), \quad \forall\, u \in \mathrm{dom}(f).
+    \label{eq:fenchel_ineq}
+\end{equation}
+Substituting $u = \frac{p_d(y_t \mid x, y_{<t})}{p_{\theta^S_k}(y_t \mid x, y_{<t})}$ and $t = r_t([x, y_{<t}], y_t)$:
+\[
+    f\!\left(\frac{p_d(y_t \mid x, y_{<t})}{p_{\theta^S_k}(y_t \mid x, y_{<t})}\right) \geq r_t([x, y_{<t}], y_t) \cdot \frac{p_d(y_t \mid x, y_{<t})}{p_{\theta^S_k}(y_t \mid x, y_{<t})} - f^*\!\left(r_t([x, y_{<t}], y_t)\right).
+\]
+Multiplying both sides by $p_{\theta^S_k}(y_t \mid x, y_{<t})$ and integrating over $y_t$:
+\[
+    \underbrace{\int f\!\left(\frac{p_d}{p_{\theta^S_k}}\right) p_{\theta^S_k}\, dy_t}_{= \Df(\Pd^{x,y_{<t}} \| \mathbb{P}_{\theta^S_k}^{x,y_{<t}})} \geq \underbrace{\int r_t \cdot p_d\, dy_t}_{= \E_{\Pd}[r_t]} - \underbrace{\int f^*(r_t) \cdot p_{\theta^S_k}\, dy_t}_{= \E_{\mathbb{P}_{\theta^S_k}}[f^*(r_t)]}.
+\]
+Maximizing the right-hand side over $r_t \in \mathcal{R}_t^k$ yields the tightest lower bound within $\mathcal{R}_t^k$.
+
+\textbf{Part (ii).} The unconstrained supremum in \eqref{eq:variational} is achieved at $r_t^* = f'(p_d / p_{\theta^S_k})$. When $r_t^* \notin \mathcal{R}_t^k$, the gap between the true $f$-divergence and the constrained maximum is bounded by the $L^2$ approximation error $d(r_t^*, \mathcal{R}_t^k)$, which measures how well $\mathcal{R}_t^k$ can approximate both $r_t^*$ and the composition $f^* \circ r_t^*$.
+\end{proof}
+
+\begin{remark}[Comparison with IPM]
+\label{rem:ipm_comparison}
+The IPM used in SWIFT corresponds to the special case where $f^*$ is the identity function. Specifically, when $f^*(t) = t$:
+\begin{equation}
+    \E_{\Pd}[r_t] - \E_{\mathbb{P}_{\theta^S_k}}[f^*(r_t)] = \E_{\Pd}[r_t] - \E_{\mathbb{P}_{\theta^S_k}}[r_t],
+\end{equation}
+which recovers the IPM formulation in \eqref{eq:ipm_token}. For any strictly convex $f$, the $f$-divergence provides a richer distance measure with the asymmetric treatment via $f^*$.
+\end{remark}
+
+\begin{remark}[Adaptive penalty mechanism]
+\label{rem:adaptive}
+Consider the KL divergence with $f^*(t) = e^{t-1}$. When a rejected token receives a high reward value $r_t = c > 1$:
+\begin{itemize}[nosep]
+    \item IPM penalty: $-c$ (linear);
+    \item $f$-divergence penalty: $-e^{c-1}$ (exponential, $|e^{c-1}| > |c|$).
+\end{itemize}
+Conversely, when $r_t = c < 0$ (rejected token already clearly distinguished):
+\begin{itemize}[nosep]
+    \item IPM penalty: $-c > 0$ (rewards distinguishing);
+    \item $f$-divergence penalty: $-e^{c-1} \approx 0$ (near zero, saves gradient).
+\end{itemize}
+This \textbf{adaptive penalty} mechanism automatically allocates stronger gradient signals to tokens that are hard to distinguish---precisely the scenario encountered in later self-play iterations.
+\end{remark}
+
+\subsection{From Token-Level to Sequence-Level Objective}
+\label{subsec:sequence_level}
+
+Following SWIFT, we aggregate the token-level $f$-divergence objectives into a sequence-level formulation. Leveraging the consistency property (\Cref{def:consistency}), we define the sequence-level reward $R(x, y) = \sum_t \gamma^{t-1} r([x, y_{<t}], y_t)$ and formulate:
+\begin{equation}
+    \max_{r \in \mathcal{R}^k} \E_{(x,y) \sim \mathcal{D},\, y' \sim \pi_{\theta^S_k}(\cdot \mid x)} \left[ R(x, y) - f^*\!\left(R(x, y')\right) \right].
+    \label{eq:seq_f_div}
+\end{equation}
+
+Note that $f^*$ wraps the \emph{entire} sequence-level rejected reward $R(x, y')$, not individual token rewards. This is consistent with applying the variational representation to the joint distributions $p_d(x, y)$ and $p_{\theta^S}(x, y)$.
+
+To enable gradient-based optimization with a well-behaved loss landscape, we introduce a non-increasing surrogate loss $l$:
+\begin{equation}
+    \min_{r \in \mathcal{R}^k} \E_{(x,y) \sim \mathcal{D},\, y' \sim \pi_{\theta^S_k}(\cdot \mid x)} \left[ l\!\left(R(x, y) - f^*\!\left(R(x, y')\right)\right) \right],
+    \label{eq:general_objective}
+\end{equation}
+where $l(t) = \log(1 + e^{-t})$ (logistic loss) is our default choice.
+
+\subsection{End-to-End Training Objective}
+\label{subsec:end_to_end}
+
+We now derive the final training objective by substituting the function family $\mathcal{R}^k$ induced by the advantage function (\Cref{eq:function_family}) into the general objective \eqref{eq:general_objective}.
+
+\begin{theorem}[f-SWIFT training objective]
+\label{thm:f_swift_objective}
+The objective function in \eqref{eq:general_objective} can be reformulated as:
+\begin{equation}
+    \min_{\pi_{\theta^S}} \E_{(x,y) \sim \mathcal{D},\, y' \sim \pi_{\theta^S_k}(\cdot \mid x)} \left[ l\!\left(u(x, y, y', \pi_{\theta^S}, \omega) - v(x, y, y', \pi_{\theta^S}, \omega)\right) \right],
+    \label{eq:f_swift_final}
+\end{equation}
+where:
+\begin{align}
+    u(x, y, y', \pi_{\theta^S}, \omega) &:= \sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y_t \mid x, y_{<t})}{\pi_{\theta^S_k}(y_t \mid x, y_{<t})} - f^*\!\left(\sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y'_t \mid x, y'_{<t})}{\pi_{\theta^S_k}(y'_t \mid x, y'_{<t})}\right), \label{eq:u_fswift} \\[6pt]
+    v(x, y, y', \pi_{\theta^S}, \omega) &:= \beta\, \DSeqKL(x, y, \omega;\, \pi_{\theta^S} \| \pi_{\theta^S_k}) - \beta\, \DSeqKL(x, y', \omega;\, \pi_{\theta^S} \| \pi_{\theta^S_k}), \label{eq:v_fswift}
+\end{align}
+with the weighted sequence KL divergence as defined in \eqref{eq:seq_kl}.
+\end{theorem}
+
+\begin{proof}
+The derivation follows three steps.
+
+\textbf{Step 1: Decompose $R$ via advantage functions.} By \Cref{lem:closed_form} and the telescoping identity from Lemma~3.6 of \cite{le2025swift}:
+\[
+    R(x, y) = \sum_t \gamma^{t-1} A^{\pi_{\theta^S_k}}\!([x, y_{<t}], y_t) + V^{\pi_{\theta^S_k}}([x, y_{<1}]).
+\]
+Since $V^{\pi_{\theta^S_k}}([x, y_{<1}]) = V^{\pi_{\theta^S_k}}([x, y'_{<1}])$ (both start from the same prompt $x$), this value term cancels in the difference $R(x,y) - f^*(R(x,y'))$ (up to the $v$ regularization term).
+
+\textbf{Step 2: Substitute the Q-function parameterization.} Using \eqref{eq:q_function}:
+\begin{align*}
+    \sum_t \gamma^{t-1} A^{\pi_{\theta^S_k}}\!([x, y_{<t}], y_t) &= \sum_t \gamma^{t-1} \omega_t^{-1} \beta \log \frac{\pi_{\theta^S}(y_t \mid x, y_{<t})}{\pi_{\theta^S_k}(y_t \mid x, y_{<t})} \\
+    &\quad + \sum_t \gamma^{t-1} \omega_t^{-1} \beta\, \DKL\!\left(\pi_{\theta^S}(\cdot \mid x, y_{<t}) \| \pi_{\theta^S_k}(\cdot \mid x, y_{<t})\right).
+\end{align*}
+
+\textbf{Step 3: Separate into $u$ and $v$.} The first line above contributes to $u$ (the discriminative score), while the KL terms contribute to $v$ (the regularization). For the rejected sequence, $f^*$ wraps the entire rejected advantage sum, yielding the $f^*(\cdot)$ term in \eqref{eq:u_fswift}. Setting $\gamma = 1$ completes the derivation.
+\end{proof}
+
+\begin{remark}[Structural comparison with SWIFT]
+The \textbf{only} difference between f-SWIFT and SWIFT lies in the treatment of the rejected term in $u$:
+\begin{align}
+    u_{\mathrm{SWIFT}} &= \underbrace{\sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y_t \mid \cdot)}{\pi_{\theta^S_k}(y_t \mid \cdot)}}_{\text{chosen (linear)}} - \underbrace{\sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y'_t \mid \cdot)}{\pi_{\theta^S_k}(y'_t \mid \cdot)}}_{\text{rejected (linear)}}, \label{eq:u_swift_compare} \\[4pt]
+    u_{\text{f-SWIFT}} &= \underbrace{\sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y_t \mid \cdot)}{\pi_{\theta^S_k}(y_t \mid \cdot)}}_{\text{chosen (unchanged)}} - \underbrace{f^*\!\left(\sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y'_t \mid \cdot)}{\pi_{\theta^S_k}(y'_t \mid \cdot)}\right)}_{\text{rejected (through } f^* \text{)}}. \label{eq:u_fswift_compare}
+\end{align}
+The $v$ term remains identical. This minimal modification provides maximum theoretical leverage.
+\end{remark}
+
+\subsection{Theoretical Properties}
+\label{subsec:theory}
+
+\begin{proposition}[SWIFT as a special case]
+\label{prop:swift_special}
+When $f^*(t) = t$ (corresponding to the identity transformation), the f-SWIFT objective \eqref{eq:f_swift_final} reduces exactly to the SWIFT objective \eqref{eq:swift_objective}.
+\end{proposition}
+
+\begin{proof}
+Direct substitution: $f^*(S_r) = S_r$ where $S_r = \sum_t \frac{\beta}{\omega_t} \log \frac{\pi_{\theta^S}(y'_t \mid \cdot)}{\pi_{\theta^S_k}(y'_t \mid \cdot)}$, hence $u_{\text{f-SWIFT}} = u_{\text{SWIFT}}$.
+\end{proof}
+
+\begin{proposition}[Convergence at optimality]
+\label{prop:convergence}
+Assume $f^*(0) = 0$ (satisfied by Jensen-Shannon, Pearson $\chi^2$, and shifted KL). If $p_{\theta^S_k}(\cdot \mid x) = p_d(\cdot \mid x)$ for all $x$, then $\theta^S_k$ is a global minimizer of \eqref{eq:f_swift_final}.
+\end{proposition}
+
+\begin{proof}
+When $p_{\theta^S_k} = p_d$, the distributions of $y$ and $y'$ are identical. Setting $\theta^S = \theta^S_k$, all log-ratios vanish: $\log \frac{\pi_{\theta^S}(\cdot)}{\pi_{\theta^S_k}(\cdot)} = 0$. Thus $S_c = 0$, $S_r = 0$, $f^*(S_r) = f^*(0) = 0$, and $v = 0$. Hence:
+\[
+    l(u - v) = l(0 - 0 - 0) = l(0) = \log 2.
+\]
+For any other $\theta^S \neq \theta^S_k$, by the convexity of $l$ and $f^*$, and Jensen's inequality (following the symmetry argument of SPIN Theorem~5.2 \cite{chen2024spin}):
+\[
+    \E[l(u - v)] \geq l(0) = \log 2.
+\]
+Therefore $\theta^S_k$ achieves the global minimum.
+\end{proof}
+
+\begin{remark}[Condition $f^*(0) = 0$]
+\label{rem:fstar_zero}
+The condition $f^*(0) = 0$ is naturally satisfied by several important $f$-divergences:
+\begin{itemize}[nosep]
+    \item Jensen-Shannon: $f^*(0) = -\log(2 - e^0) = -\log 1 = 0$. \checkmark
+    \item Pearson $\chi^2$: $f^*(0) = 0/4 + 0 = 0$. \checkmark
+    \item Squared Hellinger: $f^*(0) = 0/(1-0) = 0$. \checkmark
+\end{itemize}
+For KL divergence ($f^*(t) = e^{t-1}$), $f^*(0) = e^{-1} \neq 0$. In this case, we use the \emph{shifted conjugate} $\tilde{f}^*(t) = f^*(t) - f^*(0) = e^{t-1} - e^{-1}$, which satisfies $\tilde{f}^*(0) = 0$ while preserving the asymmetric gradient structure.
+\end{remark}
+
+\begin{proposition}[Tighter discrimination in later iterations]
+\label{prop:tighter}
+For any strictly convex $f$ with $f''(1) > 0$, when $p_{\theta^S_k}$ is close to but not equal to $p_d$ (i.e., in late iterations), the gradient magnitude of the f-SWIFT objective with respect to the rejected log-ratios is strictly larger than that of SWIFT:
+\begin{equation}
+    \left|\frac{\partial}{\partial S_r} \left(S_c - f^*(S_r)\right)\right| = |{f^*}'(S_r)| > 1 = \left|\frac{\partial}{\partial S_r} (S_c - S_r)\right|,
+    \label{eq:gradient_comparison}
+\end{equation}
+whenever $|{f^*}'(S_r)| > 1$, which holds for KL ($|{f^*}'(t)| = e^{t-1} > 1$ when $t > 1$) and $\chi^2$ ($|{f^*}'(t)| = |t/2 + 1| > 1$ when $|t| > 0$).
+\end{proposition}
+
+\subsection{Teacher-Guided Token Importance Estimation}
+\label{subsec:teacher}
+
+We inherit the token importance estimation mechanism from SWIFT without modification. The teacher model $\pi_{\theta^T}$ provides fine-grained signals for estimating the importance weight of each token.
+
+\subsubsection{Raw Weight Estimation}
+
+For the $t$-th token in a response $y = (y_1, \ldots, y_T)$:
+\begin{equation}
+    \omega_t^{\mathrm{raw}} = k \cdot \exp\!\left(\mu \cdot \mathrm{clamp}\!\left(\log \frac{\pi_{\theta^T}(y_t \mid x, y_{<t})}{\pi_{\theta^S}(y_t \mid x, y_{<t})},\; L,\; U\right)\right),
+    \label{eq:raw_weight}
+\end{equation}
+where $\mathrm{clamp}(a, L, U) = \min(\max(a, L), U)$ truncates the log-ratio to $[L, U]$ for variance reduction. Here $k > 0$ and $\mu$ are constants, and $L, U$ are clipping bounds.
+
+\textbf{Intuition.} If the teacher assigns high probability to token $y_t$ but the student assigns low probability, the log-ratio is large, resulting in a high $\omega_t$---signaling that this token is important and the student needs to learn it.
+
+\subsubsection{Cross-Tokenizer Alignment}
+
+When teacher and student use different tokenizers, direct token alignment is infeasible. Following SWIFT, we employ a \emph{shared component} strategy based on word boundaries.
+
+\textbf{Case 1: Shared tokenizer.} $\omega_t = \omega_t^{\mathrm{raw}}$ directly.
+
+\textbf{Case 2: Different tokenizers.} We segment the text into shared components $\{c_1, \ldots, c_K\}$ corresponding to complete words. For student token $y_i^S$ belonging to component $c_h$, with teacher tokens $\mathcal{T}(c_h) = \{y_j^T, \ldots, y_{j+\ell}^T\}$:
+\begin{equation}
+    \omega_i^S = \frac{1}{|\mathcal{T}(c_h)|} \sum_{y_r^T \in \mathcal{T}(c_h)} k \cdot \exp\!\left(\mu \cdot \mathrm{clamp}\!\left(\log \frac{\pi_{\theta^T}(y_r^T \mid x, y_{<r}^T)}{\pi_{\theta^S}(y_i^S \mid x, y_{<i}^S)},\; L,\; U\right)\right).
+    \label{eq:cross_tokenizer}
+\end{equation}
+
+\subsection{Complete Algorithm}
+\label{subsec:algorithm}
+
+\begin{algorithm}[t]
+\caption{f-SWIFT: $f$-Divergence Self-Play Weighted Fine-Tuning}
+\label{alg:f_swift}
+\begin{algorithmic}[1]
+\REQUIRE SFT dataset $\{(x_i, y_i)\}_{i \in [N]}$, student model $\pi_{\theta_0}$, teacher model $\pi_{\theta^T}$, convex function $f$ with conjugate $f^*$, iterations $M$, hyperparameters $\beta, k, \mu, L, U$.
+\FOR{$t = 0, \ldots, M-1$}
+    \STATE \textbf{// Step 1: Synthetic data generation}
+    \FOR{$i = 1, \ldots, N$}
+        \STATE Generate $y'_i \sim \pi_{\theta_t}(\cdot \mid x_i)$
+    \ENDFOR
+    \STATE \textbf{// Step 2: Token importance estimation}
+    \STATE Compute $\omega$ using $\pi_{\theta^T}$ and $\pi_{\theta_t}$ via \eqref{eq:raw_weight}--\eqref{eq:cross_tokenizer}
+    \STATE \textbf{// Step 3: Training with $f$-divergence objective}
+    \STATE $\theta_{t+1} = \argmin_{\theta \in \Theta} \sum_{i \in [N]} l\!\left(u(x_i, y_i, y'_i, \pi_\theta, \omega) - v(x_i, y_i, y'_i, \pi_\theta, \omega)\right)$
+    \STATE \quad where $u$ and $v$ are defined in \eqref{eq:u_fswift}--\eqref{eq:v_fswift}
+\ENDFOR
+\RETURN $\theta_M$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Practical Considerations}
+\label{subsec:practical}
+
+\subsubsection{Choice of $f$-Divergence}
+
+The choice of $f$ determines the behavior of $f^*$ on the rejected term:
+\begin{itemize}[nosep]
+    \item \textbf{Jensen-Shannon} ($f^*(t) = -\log(2 - e^t)$): Bounded and smooth; recommended as the default for stable training.
+    \item \textbf{Pearson $\chi^2$} ($f^*(t) = t^2/4 + t$): Quadratic growth; no singularities, numerically stable.
+    \item \textbf{KL with shift} ($\tilde{f}^*(t) = e^{t-1} - e^{-1}$): Exponential penalty; aggressive discrimination, suitable for late iterations.
+    \item \textbf{Squared Hellinger} ($f^*(t) = t/(1-t)$): Bounded for $t < 1$; conservative.
+\end{itemize}
+
+\subsubsection{Adaptive $f$-Scheduling}
+
+We propose an optional adaptive strategy where the choice of $f$ evolves across iterations:
+\begin{equation}
+    f_{\mathrm{iter}} =
+    \begin{cases}
+        f_{\mathrm{JS}} & \text{for iterations } 0, 1 \quad \text{(stable warm-up)}, \\
+        f_{\mathrm{KL}} & \text{for iterations } 2, 3 \quad \text{(aggressive refinement)}.
+    \end{cases}
+    \label{eq:scheduling}
+\end{equation}
+
+\subsubsection{Numerical Stability}
+
+For $f^*$ functions with potential overflow or singularities:
+\begin{itemize}[nosep]
+    \item KL ($e^{t-1}$): Clamp input to $[-C, C]$ with $C = 10$.
+    \item JS ($-\log(2 - e^t)$): Clamp input to $(-\infty, \log 2 - \epsilon)$ with $\epsilon = 0.1$.
+    \item Use the log-sum-exp trick when computing $e^{t-1}$ in mixed precision.
+\end{itemize}
+
+\subsubsection{Implementation Complexity}
+
+Relative to SWIFT, the implementation overhead is minimal---only the computation of $f^*(S_r)$ is added:
+\begin{equation}
+    \texttt{u = chosen\_score - f\_star(rejected\_score)} \quad \text{(one extra function call per sample)}.
+\end{equation}
+The teacher-guided weight estimation, cross-tokenizer alignment, training loop, and all hyperparameters remain unchanged from SWIFT.
+
+% ===== References =====
+\begin{thebibliography}{99}
+
+\bibitem{chen2024spin}
+Z.~Chen, Y.~Deng, H.~Yuan, K.~Ji, and Q.~Gu, ``Self-play fine-tuning converts weak language models to strong language models,'' in \textit{Proc. ICML}, 2024.
+
+\bibitem{le2025swift}
+T.~Le, H.~T.~Vuong, Q.~Tran, L.~Ngo~Van, M.~Harandi, and T.~Le, ``Token-level self-play with importance-aware guidance for large language models,'' in \textit{Proc. NeurIPS}, 2025.
+
+\bibitem{rafailov2023dpo}
+R.~Rafailov, A.~Sharma, E.~Mitchell, C.~D.~Manning, S.~Ermon, and C.~Finn, ``Direct preference optimization: Your language model is secretly a reward model,'' in \textit{Proc. NeurIPS}, 2023.
+
+\bibitem{zeng2024tdpo}
+Y.~Zeng, G.~Liu, W.~Ma, N.~Yang, H.~Zhang, and J.~Wang, ``Token-level direct preference optimization,'' \textit{arXiv:2404.11999}, 2024.
+
+\bibitem{liu2024tisdpo}
+A.~Liu \textit{et al.}, ``TIS-DPO: Token-level importance sampling for direct preference optimization with estimated weights,'' \textit{arXiv:2410.04350}, 2024.
+
+\bibitem{nguyen2010}
+X.~Nguyen, M.~J.~Wainwright, and M.~I.~Jordan, ``Estimating divergence functionals and the likelihood ratio by convex risk minimization,'' \textit{IEEE Trans. Inform. Theory}, vol.~56, no.~11, pp.~5847--5861, 2010.
+
+\bibitem{nowozin2016fgan}
+S.~Nowozin, B.~Cseke, and R.~Tomioka, ``$f$-GAN: Training generative neural samplers using variational divergence minimization,'' in \textit{Proc. NeurIPS}, 2016.
+
+\bibitem{ouyang2022rlhf}
+L.~Ouyang \textit{et al.}, ``Training language models to follow instructions with human feedback,'' in \textit{Proc. NeurIPS}, 2022.
+
+\bibitem{schulman2017ppo}
+J.~Schulman, F.~Wolski, P.~Dhariwal, A.~Radford, and O.~Klimov, ``Proximal policy optimization algorithms,'' \textit{arXiv:1707.06347}, 2017.
+
+\bibitem{hinton2015distill}
+G.~Hinton, O.~Vinyals, and J.~Dean, ``Distilling the knowledge in a neural network,'' \textit{arXiv:1503.02531}, 2015.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,3 +1,4 @@
+import math
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn.functional as F
@@ -153,6 +154,87 @@ def tisdpo_loss(chosen_logps_margin: torch.FloatTensor,
 
     return losses, chosen_rewards, rejected_rewards
 
+
+
+def f_star_identity(t: torch.FloatTensor) -> torch.FloatTensor:
+    """f*(t) = t. Recovers original SWIFT/IPM."""
+    return t
+
+def f_star_kl(t: torch.FloatTensor, clamp_max: float = 10.0) -> torch.FloatTensor:
+    """Shifted KL conjugate: f*(t) = e^(t-1) - e^(-1). Satisfies f*(0) = 0.
+    Paper Section 3.5 Remark: use shifted conjugate so f*(0)=0."""
+    t_clamped = torch.clamp(t, -clamp_max, clamp_max)
+    return torch.exp(t_clamped - 1.0) - math.exp(-1.0)
+
+def f_star_js(t: torch.FloatTensor, eps: float = 0.1) -> torch.FloatTensor:
+    """Jensen-Shannon conjugate: f*(t) = -log(2 - e^t). Domain: t < log(2).
+    Paper Section 3.6: recommended default, bounded and smooth."""
+    t_clamped = torch.clamp(t, max=math.log(2.0) - eps)
+    return -torch.log(2.0 - torch.exp(t_clamped))
+
+def f_star_chi2(t: torch.FloatTensor, clamp_max: float = 10.0) -> torch.FloatTensor:
+    """Pearson chi-squared conjugate: f*(t) = t^2/4 + t. Quadratic growth, clamp for stability."""
+    t_clamped = torch.clamp(t, -clamp_max, clamp_max)
+    return t_clamped * t_clamped / 4.0 + t_clamped
+
+def f_star_hellinger(t: torch.FloatTensor, eps: float = 0.01) -> torch.FloatTensor:
+    """Squared Hellinger conjugate: f*(t) = t / (1 - t). Domain: t < 1. Conservative."""
+    t_clamped = torch.clamp(t, min=-10.0, max=1.0 - eps)
+    return t_clamped / (1.0 - t_clamped)
+
+F_STAR_REGISTRY = {
+    'identity': f_star_identity,
+    'kl': f_star_kl,
+    'js': f_star_js,
+    'chi2': f_star_chi2,
+    'hellinger': f_star_hellinger,
+}
+
+def get_f_star(name: str):
+    """Get f* function by name."""
+    if name not in F_STAR_REGISTRY:
+        raise ValueError(f"Unknown f-divergence type '{name}'. Available: {list(F_STAR_REGISTRY.keys())}")
+    return F_STAR_REGISTRY[name]
+
+
+def fswift_loss(policy_chosen_logps: torch.FloatTensor,
+                policy_rejected_logps: torch.FloatTensor,
+                reference_chosen_logps: torch.FloatTensor,
+                reference_rejected_logps: torch.FloatTensor,
+                beta: float,
+                f_star_fn = f_star_js,
+                label_smoothing: float = 0.0,
+                reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+    """Compute the f-SWIFT loss for a batch of policy and reference model log probabilities.
+
+    From the paper (Eq. u_fswift), the f-SWIFT objective is:
+        u = beta * S_c - f*(beta * S_r)
+    where S_c and S_r are the chosen and rejected weighted log-ratios.
+
+    IMPORTANT: beta must be applied BEFORE f* to the rejected term, not after.
+    This is because f* is nonlinear, so beta*f*(S_r) != f*(beta*S_r).
+    The paper defines u with beta already inside the sum that f* wraps.
+    """
+    # S_c = sum_t w_t * log(pi_theta(y_t|x) / pi_theta_k(y_t|x))  (chosen)
+    # S_r = sum_t w_t * log(pi_theta(y'_t|x) / pi_theta_k(y'_t|x))  (rejected)
+    S_c = policy_chosen_logps - reference_chosen_logps
+    S_r = policy_rejected_logps - reference_rejected_logps
+
+    if reference_free:
+        S_c = policy_chosen_logps
+        S_r = policy_rejected_logps
+
+    # f-SWIFT (Eq. u_fswift): u = beta*S_c - f*(beta*S_r)
+    # beta scales the log-ratios BEFORE f* is applied to the rejected term.
+    # The loss is l(u) = log(1 + exp(-u)), i.e. no additional beta multiplier.
+    logits = beta * S_c - f_star_fn(beta * S_r)
+
+    losses = -F.logsigmoid(logits) * (1 - label_smoothing) - F.logsigmoid(-logits) * label_smoothing
+
+    chosen_rewards = beta * S_c.detach()
+    rejected_rewards = beta * S_r.detach()
+
+    return losses, chosen_rewards, rejected_rewards
 
 
 def preference_loss(policy_chosen_logps: torch.FloatTensor,
@@ -371,7 +453,7 @@ class BasicTrainer(object):
             policy_output = self.policy.generate(
                 batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
 
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'fswift'}:
             ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
             with ctx():
                 reference_output = self.reference_model.generate(
@@ -381,7 +463,7 @@ class BasicTrainer(object):
         policy_output = all_gather_if_needed(policy_output, self.rank, self.world_size)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'fswift'}:
             reference_output = pad_to_length(reference_output, self.config.max_length, self.tokenizer.pad_token_id)
             reference_output = all_gather_if_needed(reference_output, self.rank, self.world_size)
             reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
@@ -550,6 +632,44 @@ class BasicTrainer(object):
             policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
 
+        elif loss_config.name == 'fswift':
+            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
+            with torch.no_grad():
+                reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
+
+            # Resolve f* function: support adaptive scheduling per iteration
+            f_div_type = getattr(loss_config, 'f_divergence', 'js')
+            if hasattr(loss_config, 'f_schedule') and loss_config.f_schedule:
+                # Adaptive scheduling: use iteration index to pick f-divergence
+                current_iter = getattr(self, '_current_iteration', 0)
+                schedule = loss_config.f_schedule
+                for entry in schedule:
+                    if current_iter >= entry.get('from_iter', 0):
+                        f_div_type = entry.get('f_divergence', f_div_type)
+            f_star_fn = get_f_star(f_div_type)
+
+            losses, chosen_rewards, rejected_rewards = fswift_loss(
+                policy_chosen_logps, policy_rejected_logps,
+                reference_chosen_logps, reference_rejected_logps,
+                beta=loss_config.beta, f_star_fn=f_star_fn,
+                label_smoothing=loss_config.label_smoothing,
+                reference_free=loss_config.reference_free)
+
+            reward_accuracies = (chosen_rewards > rejected_rewards).float()
+
+            chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
+            rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
+            reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
+
+            metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
+            metrics[f'f_divergence_type'] = [f_div_type]
+
+            policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
+            metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
+
         elif loss_config.name == 'sft':
             policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask']).logits.to(torch.float32)
             policy_chosen_logps = _get_batch_logps(policy_chosen_logits, batch['chosen_labels'], average_log_prob=False, token_level=False)
@@ -575,7 +695,7 @@ class BasicTrainer(object):
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'fswift'}:
             self.reference_model.eval()
 
         self.example_counter = 0
@@ -742,7 +862,7 @@ class FSDPTrainer(BasicTrainer):
                 apply_activation_checkpointing(self.policy, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
                 rank0_print('FSDP activation checkpointing enabled!')
 
-        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'fswift'}:
             rank0_print('Sharding reference model...')
             self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
         
@@ -803,7 +923,7 @@ class TensorParallelTrainer(BasicTrainer):
         
         rank0_print('Sharding policy...')
         self.policy = tp.tensor_parallel(policy, sharded=True)
-        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'fswift'}:
             rank0_print('Sharding reference model...')
             self.reference_model = tp.tensor_parallel(reference_model, sharded=False)
 
