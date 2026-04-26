@@ -161,10 +161,12 @@ def f_star_identity(t: torch.FloatTensor) -> torch.FloatTensor:
     return t
 
 def f_star_kl(t: torch.FloatTensor, clamp_max: float = 10.0) -> torch.FloatTensor:
-    """Shifted KL conjugate: f*(t) = e^(t-1) - e^(-1). Satisfies f*(0) = 0.
-    Paper Section 3.5 Remark: use shifted conjugate so f*(0)=0."""
+    """Unshifted KL conjugate: f*(t) = e^(t-1). Satisfies f*(t) >= t (required by Prop. 2).
+    NOTE: f*(0) = e^(-1) != 0, but f*(t) >= t holds everywhere — convergence guaranteed.
+    The shifted variant f*(t) = e^(t-1) - e^(-1) satisfies f*(0)=0 but violates f*(t)>=t
+    near t=0, breaking the convergence proof (paper Table 1, Remark 3)."""
     t_clamped = torch.clamp(t, -clamp_max, clamp_max)
-    return torch.exp(t_clamped - 1.0) - math.exp(-1.0)
+    return torch.exp(t_clamped - 1.0)
 
 def f_star_js(t: torch.FloatTensor, eps: float = 0.1) -> torch.FloatTensor:
     """Jensen-Shannon conjugate: f*(t) = -log(2 - e^t). Domain: t < log(2).
@@ -182,12 +184,24 @@ def f_star_hellinger(t: torch.FloatTensor, eps: float = 0.01) -> torch.FloatTens
     t_clamped = torch.clamp(t, min=-10.0, max=1.0 - eps)
     return t_clamped / (1.0 - t_clamped)
 
+def f_star_wasserstein(t: torch.FloatTensor, c: float = 1.0) -> torch.FloatTensor:
+    """Wasserstein-1 (WGAN-style) conjugate: f*(t) = clamp(t, -c, c).
+    Enforces c-Lipschitz constraint on the critic, matching the dual formulation
+    of W1: sup_{||f||_Lip <= c} E[f(y)] - E[f(y')].
+    - f*(0) = 0 satisfied (clamp(0) = 0). checkmark
+    - f*(t) >= t NOT satisfied for t > c (clipped), so convergence proof
+      (Prop. 2) does not apply. Gradient is 1 when |t| < c, 0 at boundary.
+    - Best used in later iterations where S_r is large and JS/KL saturate.
+    - Recommended c: 1.0 (standard WGAN) or tune in [0.5, 3.0]."""
+    return torch.clamp(t, min=-c, max=c)
+
 F_STAR_REGISTRY = {
     'identity': f_star_identity,
     'kl': f_star_kl,
     'js': f_star_js,
     'chi2': f_star_chi2,
     'hellinger': f_star_hellinger,
+    'wasserstein': f_star_wasserstein,
 }
 
 def get_f_star(name: str):
@@ -474,14 +488,24 @@ class BasicTrainer(object):
     
     def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
-        
-           We do this to avoid doing two forward passes, because it's faster for FSDP.
-        """
 
+           We do this to avoid doing two forward passes, because it's faster for FSDP.
+           Automatically moves batch to the model's device to support CPU-offloaded reference models.
+        """
         concatenated_batch = concatenated_inputs(batch)
-        # dict_keys(['concatenated_weight', 'concatenated_input_ids', 'concatenated_attention_mask', 'concatenated_labels'])
-        all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
-        all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], concatenated_batch['concatenated_weight'], average_log_prob=False, token_level=self.config.loss.token_level)
+        model_device = next(model.parameters()).device
+        input_ids = concatenated_batch['concatenated_input_ids'].to(model_device)
+        attention_mask = concatenated_batch['concatenated_attention_mask'].to(model_device)
+        labels = concatenated_batch['concatenated_labels'].to(model_device)
+        weights = concatenated_batch['concatenated_weight'].to(model_device)
+
+        if input_ids.shape[0] == 0:
+            raise ValueError("concatenated_forward received an empty batch (0 examples). Check for empty responses in your dataset.")
+
+        all_logits = model(input_ids, attention_mask=attention_mask).logits.to(torch.float32)
+        all_logps = _get_batch_logps(all_logits, labels, weights, average_log_prob=False, token_level=self.config.loss.token_level)
+        # move results back to the policy device (cuda) before returning
+        all_logps = all_logps.to(self.policy.device if hasattr(self.policy, 'device') else 'cuda')
         chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
         rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
         return chosen_logps, rejected_logps
@@ -702,15 +726,21 @@ class BasicTrainer(object):
         self.batch_counter = 0
         last_log = None
 
+        # Per-epoch checkpoint: inferred from dataset size and batch_size
+        examples_per_epoch = self.config.get('examples_per_epoch', None)
+        last_saved_epoch = -1
+
         for batch in self.train_iterator:
             # #### BEGIN EVALUATION ####
             # if self.example_counter > 5: break  ### Early stop to obtain good checkpoint
-            if self.example_counter % 2000 == 0:
-            # if False:
+            # if self.example_counter % 2000 == 0:
+            if False:
                 print('Saving model to LASTEST ...')
                 self.policy.save_pretrained("model_hub/Qwen1.5-1.8B/LASTEST", safe_serialization=True)
+                self.tokenizer.save_pretrained("model_hub/Qwen1.5-1.8B/LASTEST")
                 print(f'Evaluating ...')
-                bash_command = "bash lm-evaluation-harness/eval_llm.sh"
+                lastest_path = os.path.abspath("model_hub/Qwen1.5-1.8B/LASTEST")
+                bash_command = f"bash lm-evaluation-harness/eval_llm.sh {lastest_path}"
                 try:
                     # subprocess.run(bash_command, shell=True, check=True)
                     result = subprocess.run(bash_command, shell=True, check=True, capture_output=True, text=True)
@@ -720,6 +750,8 @@ class BasicTrainer(object):
                 except subprocess.CalledProcessError as e:
                     print("An error occurred while executing the script.")
                     print("Error details:", e)
+                    print("STDOUT:", e.stdout)
+                    print("STDERR:", e.stderr)
             # #### END EVALUATION ####
 
             #### BEGIN TRAINING ####
@@ -749,9 +781,19 @@ class BasicTrainer(object):
             self.batch_counter += 1
             self.example_counter += self.config.batch_size
 
-            # if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
+            # Save checkpoint at end of each epoch
+            if examples_per_epoch is not None:
+                current_epoch = (self.example_counter - 1) // examples_per_epoch
+                if current_epoch > last_saved_epoch:
+                    last_saved_epoch = current_epoch
+                    epoch_ckpt_dir = os.path.join(self.ckpt_dir, f'epoch{current_epoch}')
+                    rank0_print(f'Saving epoch {current_epoch} checkpoint to {epoch_ckpt_dir}')
+                    os.makedirs(epoch_ckpt_dir, exist_ok=True)
+                    self.policy.save_pretrained(epoch_ckpt_dir)
+                    self.tokenizer.save_pretrained(epoch_ckpt_dir)
+
             if self.example_counter % 50 == 0:
-                mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
+                mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items() if isinstance(v[0], (int, float))}
                 mean_train_metrics['counters/examples'] = self.example_counter
                 mean_train_metrics['counters/updates'] = self.batch_counter
                 rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')

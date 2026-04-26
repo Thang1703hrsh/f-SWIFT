@@ -83,7 +83,8 @@ def main(config: DictConfig):
     # config.max_prompt_length = 1024 - 256
     # config.model="gpt2"
     # config.model.name_or_path="model_hub/gpt2_120M/"
-    config.loss.beta = 0.1
+    if config.loss.name != 'sft':
+        config.loss.beta = 0.1
     missing_keys: Set[str] = OmegaConf.missing_keys(config)
     if missing_keys:
         raise ValueError(f"Got missing keys in config:\n{missing_keys}")
@@ -122,13 +123,17 @@ def main(config: DictConfig):
         config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     policy_tokenizer = transformers.AutoTokenizer.from_pretrained(config.model.name_or_path)
     disable_dropout(policy)
+    if config.get('activation_checkpointing', False):
+        policy.gradient_checkpointing_enable()
+        print('Gradient checkpointing enabled for policy')
 
     if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'fswift'}:
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
-        # reference_model_dtype = torch.float16
+        # Load reference model on CPU to save GPU VRAM; BasicTrainer moves batches to GPU when needed
+        ref_kwargs = {'device_map': 'cpu'} if config.trainer == 'BasicTrainer' else model_kwargs
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
-            config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=reference_model_dtype, **model_kwargs)
+            config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=reference_model_dtype, **ref_kwargs)
         disable_dropout(reference_model)
     else:
         reference_model = None

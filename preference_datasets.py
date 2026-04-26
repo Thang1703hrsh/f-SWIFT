@@ -415,9 +415,14 @@ def get_batch_iterator(names: List[str],
                 for index, p in enumerate(pairs):
                     if done:
                         break
+                    chosen_resp = responses[p[0]]
+                    rejected_resp = responses[p[1]]
+                    # skip examples with empty responses to avoid zero-size tensors
+                    if not chosen_resp or not chosen_resp.strip() or not rejected_resp or not rejected_resp.strip():
+                        continue
                     rejected_weight_item = rejected_weight[index] if rejected_weight else None
                     chosen_weight_item = chosen_weight[index] if chosen_weight else None
-                    batch_element = tokenize_batch_element(prompt, responses[p[0]], responses[p[1]], truncation_mode, tokenizer, max_length, max_prompt_length, rejected_weight_item, chosen_weight_item)
+                    batch_element = tokenize_batch_element(prompt, chosen_resp, rejected_resp, truncation_mode, tokenizer, max_length, max_prompt_length, rejected_weight_item, chosen_weight_item)
                     batch.append(batch_element)
                     example_idx += 1
                     if len(batch) == batch_size:

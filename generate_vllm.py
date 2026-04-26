@@ -41,11 +41,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_path)   
     tokenizer.pad_token = tokenizer.eos_token
 
+    # Read max_position_embeddings from model config to avoid vLLM validation error
+    from transformers import AutoConfig as _AC
+    _cfg = _AC.from_pretrained(model_path)
+    _max_len = getattr(_cfg, 'max_position_embeddings', 2048)
+
     llm = LLM(
         model=model_path,
         tensor_parallel_size=world_size,
         dtype="float16",
-        max_model_len=4096,     
+        max_model_len=_max_len,
         gpu_memory_utilization=0.9
     )
 
@@ -75,14 +80,23 @@ def main():
             data = data[sub_len*data_frac:sub_len*(data_frac+1)]
     else:
         data = data[:]
-    prompts_all = [data[idx]['prompt']for idx in range(len(data))]
+    # Truncate prompts that exceed max_prompt_len to avoid vLLM context errors
+    max_prompt_tokens = _max_len - args.max_new_tokens
+    def truncate_prompt(text):
+        ids = tokenizer.encode(text)
+        if len(ids) > max_prompt_tokens:
+            ids = ids[-max_prompt_tokens:]  # keep the tail (instruction end)
+        return tokenizer.decode(ids, skip_special_tokens=True)
+
+    prompts_all = [truncate_prompt(data[idx]['prompt']) for idx in range(len(data))]
     prompts_old = [data[idx]['prompt'] for idx in range(len(data))]
-    corrects_all = [data[idx]['ground_truth'] for idx in range(len(data))]
+    # support both 'chosen' (distillation format) and legacy 'ground_truth' field
+    corrects_all = [data[idx].get('chosen', data[idx].get('ground_truth', '')) for idx in range(len(data))]
 
     start=time.time()
 
     #run vllm
-    results_gathered = list(map(lambda x: x.outputs[0].text, 
+    results_gathered = list(map(lambda x: x.outputs[0].text,
                                 llm.generate(prompts_all, sampling_params)))
 
     results = [r.replace("</s>","").lstrip() for r in results_gathered]
@@ -90,15 +104,14 @@ def main():
     timediff=time.time()-start
     print(f"time elapsed: {timediff}")
 
-    # collecting data
-    for idx in tqdm(range(len(corrects_all))):
-        # d = {"real": [{"role": "user", "content": prompts_old[idx]}, {"role": "assistant", "content": corrects_all[idx]}], "generated": [{"role": "user", "content": prompts_old[idx]}, {"role": "assistant", "content": results[idx]}]}
-        d = {"prompt": data[idx]['prompt'], "chosen": data[idx]['ground_truth'], "rejected": results[idx]}
-        if args.split == 'test':
-            filename = f"{args.output_dir}/{args.data_frac}_test.jsonl"
-        else:
-            filename = f"{args.output_dir}.jsonl"
-        with open(filename, 'a') as f:
+    # collecting data — write all at once with 'w' to avoid duplicates on re-run
+    if args.split == 'test':
+        filename = f"{args.output_dir}/{args.data_frac}_test.jsonl"
+    else:
+        filename = f"{args.output_dir}.jsonl"
+    with open(filename, 'w') as f:
+        for idx in tqdm(range(len(corrects_all))):
+            d = {"prompt": data[idx]['prompt'], "chosen": corrects_all[idx], "rejected": results[idx]}
             json.dump(d, f)
             f.write('\n')
 

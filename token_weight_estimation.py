@@ -287,84 +287,62 @@ def calculate_probability_differences_SWPIN(model_1, model_2, max_seq_len_2, max
             'attention_mask': torch.stack(padded_attention_mask_2).to(device)
         }
         
-        # Get logits
+        # Compute prompt lengths directly from already-tokenized tensors (no extra encode() calls)
+        prompt_lengths_1 = [
+            min(allow_length,
+                int((tokenized_prompts_1.input_ids[j] != tokenizer_1.pad_token_id).sum().item())) - 1
+            for j in range(len(batch_prompts_1))
+        ]
+        prompt_lengths_2 = [
+            min(allow_length,
+                int((tokenized_prompts_2.input_ids[j] != tokenizer_2.pad_token_id).sum().item())) - 1
+            for j in range(len(batch_prompts_1))
+        ]
+
+        # Pre-compute student→teacher token maps for the whole batch
+        student_maps_batch = [
+            identify_token(batch_responses[j], tokenizer_1, tokenizer_2)
+            if batch_responses[j] else []
+            for j in range(len(batch_prompts_1))
+        ]
+
+        # Get logits — keep on GPU, gather token scores vectorized
         with torch.no_grad():
-            logits_1 = model_1(**inputs_1).logits
-            # logits_2 = model_2(**inputs_2).logits
+            logits_1 = model_1(**inputs_1).logits  # (B, T, V)
+
+        logits_1 = torch.log_softmax(logits_1, dim=-1)  # stay on GPU
 
         # Calculate probability differences
         batch_weights = []
         batch_explain_data = []
 
-        logits_1 = torch.log_softmax(logits_1, dim=-1).cpu().numpy()
-
-        # alpha = 4.7
-        # logits_2 = logits_2 + alpha
-        # logits_2 = torch.log_softmax(logits_2, dim=-1).cpu().numpy()
-        # logits_1 = logits_1 / 3.0
+        seq_len_1 = logits_1.shape[1]
 
         for j in range(len(batch_prompts_1)):
             weights = []
-            # explain_data = []
-            # sc1 = []
-            # sc2 = []
-            if len(batch_responses[j]) > 0:
-                prompt_length_1 = min(allow_length, len(tokenizer_1.encode(batch_prompts_1[j]))) - 1  # Exclude the last token of prompt
-                prompt_length_2 = min(allow_length, len(tokenizer_2.encode(batch_prompts_2[j]))) - 1  # Exclude the last token of prompt
-                student_map = identify_token(batch_responses[j], tokenizer_1, tokenizer_2)[:(max_seq_len_2-prompt_length_2-1)]
-                for k in range(len(student_map)):
-                    score_1 = 0
-                    for teacher_index in student_map[k]['teacher_index']:
-                        actual_next_token_id_1 = inputs_1['input_ids'][j, prompt_length_1 + teacher_index].item()
-                        score_1 += logits_1[j, prompt_length_1 + teacher_index, actual_next_token_id_1]
-                    score_1 = score_1 / len(student_map[k]['teacher_index'])
-                    
-                    actual_next_token_id_2 = inputs_2['input_ids'][j, prompt_length_2 + k + 1].item()
-                    # score_2 = logits_2[j, prompt_length_2 + k, actual_next_token_id_2]
-                    # weight = 4.7 * score_2 - score_1
-                    weight = (-score_1)
-                    # weight = torch.tensor(weight,
-                    #                     dtype=torch.float16,
-                    #                     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-                    # if is_rejected == True:
-                    #     weight = weight.clamp(min=1.1)
-                    #     weight = 3.0 / torch.log(weight)
-                    # weight = torch.tensor(weight,
-                    #                     dtype=torch.float16,
-                    #                     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-                    # weights.append(round(weight.item(), 2))
+            if not batch_responses[j]:
+                batch_weights.append(weights)
+                continue
 
-                    # weight = - score_1
-                    # if is_rejected == True:
-                    #     weight = (- weight / 2)
-                    # else:
-                    #     pass
-                        # print(f'score_1 = {round(float(score_1), 5)}')
-                    # temp = weight
-                    # if is_rejected == True:
-                    #     if temp > 15.0:
-                    #         weight = 0.5
-                    #     elif temp <= 15.0:
-                    #         weight = 1.0
-                    # else:
-                    #     if temp > 15.0:
-                    #         weight = 1.25
-                    #     elif (temp <= 15.0) and (temp >= 10.0):
-                    #         weight = 1.0
-                    #     else:
-                    #         weight = 0.75
-                    # sc1.append(round(float(score_1), 2))
-                    # sc2.append(round(float(score_2), 2))
-                    weights.append(round(float(weight), 2))
-            # print(f'>>> response = {batch_responses[j]}')
-            # print(f'### sc1 = {sc1}')
-            # print(f'### sc2 = {sc2}')
-            # print(f'### weights = {weights}')
-            # print(f'type = {type(weights)}')
+            p1 = prompt_lengths_1[j]
+            p2 = prompt_lengths_2[j]
+            student_map = student_maps_batch[j][:(max_seq_len_2 - p2 - 1)]
+
+            for k in range(len(student_map)):
+                valid_indices = [ti for ti in student_map[k]['teacher_index']
+                                 if p1 + ti < seq_len_1]
+                if not valid_indices:
+                    weights.append(0.0)
+                    continue
+                # Gather scores on GPU for all valid teacher positions at once
+                t_positions = torch.tensor(valid_indices, dtype=torch.long, device=logits_1.device) + p1
+                token_ids = inputs_1['input_ids'][j, t_positions]          # (n_valid,)
+                scores = logits_1[j, t_positions, token_ids]               # (n_valid,)
+                score_1 = scores.mean().item()
+                weight = -score_1
+                weights.append(round(float(weight), 2))
+
             weights = softmax_scaled(weights, type_)
-            # if is_rejected == True:
-            #     weights = [-ele/2 for ele in weights]
-                # print(f'weights = {weights}')
             batch_weights.append(weights)
         
         all_weights.extend(batch_weights)

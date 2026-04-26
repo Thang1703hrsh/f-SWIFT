@@ -1,37 +1,45 @@
 from huggingface_hub import snapshot_download
 
-# Repository ID and local directory
-# repo_id = "alignment-handbook/zephyr-7b-sft-full" 
-# local_dir = "model_hub/zephyr-7b-sft-full"  # Specify your desired local directory
-repo_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" 
-local_dir = "model_hub/TinyLlama-1.1B/base"  # Specify your desired local directory
+# DOWNLOAD BASE MODEL FOR TABLE 1
+repo_id_base = "Qwen/Qwen1.5-1.8B" 
+local_dir_base = "model_hub/Qwen1.5-1.8B/base"  
 
-# Download the model repository
-print(f"Downloading model from {repo_id} to {local_dir}...")
+print(f"Downloading model from {repo_id_base} to {local_dir_base}...")
 snapshot_download(
-    repo_id=repo_id,
-    repo_type="model",  # Specify repo type as 'model'
-    local_dir=local_dir,  # Specify the local directory
-    local_dir_use_symlinks=False,  # Avoid symlinks for complete local copy
+    repo_id=repo_id_base,
+    repo_type="model", 
+    local_dir=local_dir_base, 
+    local_dir_use_symlinks=False, 
 )
-
-print(f"Model successfully downloaded to {local_dir}!")
+print(f"Base Model successfully downloaded to {local_dir_base}!")
 
 ###################################################################
 
-# Repository ID and local directory
-repo_id = "alignment-handbook/zephyr-7b-sft-full" 
-local_dir = "model_hub/zephyr-7b-sft-full"  # Specify your desired local directory
-# repo_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" 
-# local_dir = "model_hub/TinyLlama-1.1B/base"  # Specify your desired local directory
+# DOWNLOAD TEACHER MODEL FOR TABLE 1
+repo_id_teacher = "alignment-handbook/zephyr-7b-sft-full" 
+local_dir_teacher = "model_hub/zephyr-7b-sft-full"  
 
-# Download the model repository
-print(f"Downloading model from {repo_id} to {local_dir}...")
+print(f"Downloading model from {repo_id_teacher} to {local_dir_teacher}...")
 snapshot_download(
-    repo_id=repo_id,
-    repo_type="model",  # Specify repo type as 'model'
-    local_dir=local_dir,  # Specify the local directory
-    local_dir_use_symlinks=False,  # Avoid symlinks for complete local copy
+    repo_id=repo_id_teacher,
+    repo_type="model", 
+    local_dir=local_dir_teacher, 
+    local_dir_use_symlinks=False, 
 )
+print(f"Teacher Model successfully downloaded to {local_dir_teacher}!")
 
-print(f"Model successfully downloaded to {local_dir}!")
+###################################################################
+
+# DOWNLOAD DATASET
+# Repository ID and the local directory to save it
+repo_id_dataset = "UCLA-AGI/SPIN_iter1" 
+local_dir_dataset = "data_hub/SPIN_iter1"  # You can rename this directory
+
+print(f"Downloading dataset from {repo_id_dataset} to {local_dir_dataset}...")
+snapshot_download(
+    repo_id=repo_id_dataset,
+    repo_type="dataset",  # Specify the repo type as a dataset
+    local_dir=local_dir_dataset,  
+    local_dir_use_symlinks=False, 
+)
+print(f"Dataset successfully downloaded to {local_dir_dataset}!")
